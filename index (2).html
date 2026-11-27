@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>宛名読み取りカメラ</title>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 20px; min-height: 100vh;
+      font-family: Arial, "Hiragino Kaku Gothic ProN", "Meiryo", sans-serif;
+      background: #eef3f9; color: #222;
+    }
+    .container {
+      max-width: 760px; margin: 0 auto; padding: 20px;
+      background: #fff; border-radius: 16px;
+      box-shadow: 0 8px 24px rgba(0,0,0,.10);
+    }
+    h1 { font-size: 22px; text-align: center; margin: 0 0 14px; }
+    #status {
+      min-height: 46px; padding: 10px; margin-bottom: 12px;
+      text-align: center; font-weight: bold; color: #075aa8;
+    }
+    .camera-wrap {
+      position: relative; overflow: hidden; border-radius: 12px;
+      background: #111; min-height: 220px;
+    }
+    video { display: block; width: 100%; max-height: 65vh; object-fit: contain; }
+    .scan-guide {
+      position: absolute; left: 10%; top: 20%; width: 80%; height: 60%;
+      border: 3px dashed rgba(255,255,255,.95); border-radius: 12px;
+      box-shadow: 0 0 0 9999px rgba(0,0,0,.28); pointer-events: none;
+    }
+    .hint { font-size: 13px; color: #555; line-height: 1.6; margin: 12px 0; }
+    .buttons { display: flex; gap: 10px; margin-top: 14px; }
+    button {
+      flex: 1; border: 0; border-radius: 10px; padding: 14px 12px;
+      font-size: 16px; font-weight: bold; cursor: pointer;
+    }
+    #startBtn { background: #16834a; color: white; }
+    #closeBtn { background: #555; color: white; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    @media (max-width: 520px) {
+      body { padding: 8px; }
+      .container { padding: 12px; }
+      .buttons { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <h1>宛名読み取りカメラ</h1>
+    <div id="status">元のアプリと接続しています…</div>
+    <div class="camera-wrap">
+      <video id="video" autoplay muted playsinline></video>
+      <div class="scan-guide"></div>
+    </div>
+    <p class="hint">
+      宛名を中央の枠内に入れてください。文字を認識すると、元のアプリで該当する先生が自動選択されます。
+      うまく読み取れない場合は、明るい場所で宛名を枠に近づけてください。
+    </p>
+    <div class="buttons">
+      <button id="startBtn" type="button" disabled>カメラを起動する</button>
+      <button id="closeBtn" type="button">閉じる</button>
+    </div>
+  </main>
+
+<script>
+'use strict';
+
+const parentOrigin = new URLSearchParams(location.search).get('parentOrigin') || '';
+const video = document.getElementById('video');
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('startBtn');
+const closeBtn = document.getElementById('closeBtn');
+
+let staff = [];
+let stream = null;
+let worker = null;
+let scanning = false;
+let processing = false;
+let scanTimer = null;
+let resultSent = false;
+
+function normalize(value) {
+  return String(value || '').replace(/[\s　\u3000]/g, '').replace(/[・･.,，。:：]/g, '');
+}
+
+function sendToParent(message) {
+  if (window.opener && !window.opener.closed && parentOrigin) {
+    window.opener.postMessage(message, parentOrigin);
+  }
+}
+
+function showError(err) {
+  const name = err && err.name ? err.name : 'UnknownError';
+  const messages = {
+    NotAllowedError: 'カメラへのアクセスが拒否されました。Chromeのサイト設定でカメラを許可してください。',
+    PermissionDeniedError: 'カメラへのアクセスが拒否されました。Chromeのサイト設定を確認してください。',
+    NotFoundError: '利用できるカメラが見つかりません。',
+    NotReadableError: 'カメラを使用できません。他のアプリでカメラを使っていないか確認してください。',
+    SecurityError: 'HTTPSで開かれていないため、カメラを利用できません。'
+  };
+  const message = (messages[name] || 'カメラを起動できませんでした。ブラウザのカメラ権限を確認してください。') + ` (${name})`;
+  statusEl.textContent = message;
+  statusEl.style.color = '#b00020';
+  sendToParent({ type: 'camera-error', name: name, message: message });
+}
+
+async function stopCamera() {
+  scanning = false;
+  processing = false;
+  if (scanTimer) {
+    clearTimeout(scanTimer);
+    scanTimer = null;
+  }
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+  video.srcObject = null;
+}
+
+async function startCamera() {
+  if (scanning) return;
+  if (!staff.length) {
+    statusEl.textContent = '先生一覧を受信できていません。元のアプリから開き直してください。';
+    return;
+  }
+
+  startBtn.disabled = true;
+  statusEl.style.color = '#075aa8';
+  statusEl.textContent = 'カメラを起動しています…';
+
+  try {
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      const secureError = new Error('カメラを使うにはHTTPS接続が必要です。');
+      secureError.name = 'SecurityError';
+      throw secureError;
+    }
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      },
+      audio: false
+    });
+
+    video.srcObject = stream;
+    await video.play();
+
+    if (!worker) {
+      statusEl.textContent = '日本語の文字認識エンジンを準備しています。初回は少し時間がかかります…';
+      worker = await Tesseract.createWorker('jpn');
+    }
+
+    scanning = true;
+    resultSent = false;
+    statusEl.textContent = '読み取り中です。宛名を中央の枠内にかざしてください。';
+    statusEl.style.color = '#075aa8';
+    scanLoop();
+  } catch (err) {
+    console.error('Camera/OCR start error:', err);
+    await stopCamera();
+    showError(err);
+    startBtn.disabled = false;
+  }
+}
+
+async function scanLoop() {
+  if (!scanning || resultSent) return;
+  if (processing || !video.videoWidth || !video.videoHeight) {
+    scanTimer = setTimeout(scanLoop, 500);
+    return;
+  }
+
+  processing = true;
+  try {
+    const cropWidth = Math.floor(video.videoWidth * 0.8);
+    const cropHeight = Math.floor(video.videoHeight * 0.6);
+    const cropX = Math.floor((video.videoWidth - cropWidth) / 2);
+    const cropY = Math.floor((video.videoHeight - cropHeight) / 2);
+    const canvas = document.createElement('canvas');
+    canvas.width = cropWidth;
+    canvas.height = cropHeight;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(video, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const pixels = imageData.data;
+    const contrast = 1.25;
+    for (let i = 0; i < pixels.length; i += 4) {
+      const gray = pixels[i] * 0.299 + pixels[i + 1] * 0.587 + pixels[i + 2] * 0.114;
+      const adjusted = Math.max(0, Math.min(255, (gray - 128) * contrast + 128));
+      pixels[i] = pixels[i + 1] = pixels[i + 2] = adjusted;
+    }
+    ctx.putImageData(imageData, 0, 0);
+
+    const result = await worker.recognize(canvas);
+    const recognizedText = normalize(result && result.data ? result.data.text : '');
+
+    const match = staff.find(person => {
+      const name = normalize(person.name);
+      return name.length >= 2 && recognizedText.includes(name);
+    });
+
+    if (match) {
+      resultSent = true;
+      scanning = false;
+      if (navigator.vibrate) navigator.vibrate(180);
+      statusEl.textContent = `「${match.name} 先生」を検出しました。元のアプリに反映します。`;
+      statusEl.style.color = '#168044';
+      sendToParent({ type: 'teacher-found', category: match.category, name: match.name });
+      await stopCamera();
+      return;
+    }
+
+    statusEl.textContent = '読み取り中… 宛名を中央の枠内にかざしてください。';
+    statusEl.style.color = '#075aa8';
+  } catch (err) {
+    console.warn('OCR frame error:', err);
+    statusEl.textContent = '文字を読み取れません。宛名を明るい場所で枠内に近づけてください。';
+  } finally {
+    processing = false;
+    if (scanning) scanTimer = setTimeout(scanLoop, 500);
+  }
+}
+
+startBtn.addEventListener('click', startCamera);
+closeBtn.addEventListener('click', async () => {
+  await stopCamera();
+  sendToParent({ type: 'camera-closed' });
+  window.close();
+});
+
+window.addEventListener('message', event => {
+  if (!parentOrigin || event.origin !== parentOrigin) return;
+  if (!window.opener || event.source !== window.opener) return;
+  const data = event.data || {};
+  if (data.type !== 'teacher-data') return;
+
+  staff = Array.isArray(data.staff) ? data.staff.filter(p => p && p.category && p.name) : [];
+  if (!staff.length) {
+    statusEl.textContent = '先生一覧が空です。スプレッドシートの登録内容を確認してください。';
+    statusEl.style.color = '#b00020';
+    return;
+  }
+
+  statusEl.textContent = `先生一覧 ${staff.length}名を読み込みました。カメラを起動してください。`;
+  statusEl.style.color = '#168044';
+  startBtn.disabled = false;
+});
+
+window.addEventListener('beforeunload', () => {
+  if (stream) stream.getTracks().forEach(track => track.stop());
+  if (worker) worker.terminate();
+});
+
+if (!parentOrigin || !/^https:\/\//i.test(parentOrigin)) {
+  statusEl.textContent = '元のアプリから開いてください。接続情報が確認できません。';
+  statusEl.style.color = '#b00020';
+  startBtn.disabled = true;
+} else if (window.opener && !window.opener.closed) {
+  window.opener.postMessage({ type: 'camera-ready' }, parentOrigin);
+} else {
+  statusEl.textContent = '元のアプリとの接続がありません。元のアプリからカメラを開き直してください。';
+  statusEl.style.color = '#b00020';
+}
+</script>
+</body>
+</html>
